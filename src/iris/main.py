@@ -16,6 +16,7 @@ from iris.fetcher import PageFetcher
 from iris.logging import setup_logging
 from iris.routes.fetch import router as fetch_router
 from iris.routes.health import router as health_router
+from iris.sentinel_sdk import SentinelClient
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Iris starting up (testing_mode=%s)", settings.TESTING_MODE)
 
     app.state.start_time = time.monotonic()
+
+    # Sentinel client
+    sentinel: SentinelClient | None = None
+    if not settings.TESTING_MODE:
+        satellite_secret = settings.get_satellite_secret()
+        sentinel = SentinelClient(
+            sentinel_url=str(settings.SENTINEL_URL),
+            satellite_id=settings.SATELLITE_ID,
+            satellite_secret=satellite_secret,
+            cert_path=settings.SENTINEL_CERT_PATH,
+            key_path=settings.SENTINEL_KEY_PATH,
+            ca_path=settings.SENTINEL_CA_PATH,
+            testing_mode=False,
+        )
+        try:
+            await sentinel.connect()
+            logger.info("Sentinel connected")
+        except Exception as e:
+            logger.error("Failed to connect to Sentinel: %s", e)
+            # Continue startup — health endpoint will report degraded
+    else:
+        logger.info("Testing mode — skipping Sentinel")
+    app.state.sentinel = sentinel
 
     # Cache
     cache = CacheLayer(settings)
@@ -55,6 +79,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     await fetcher.close()
     await cache.close()
+    if sentinel:
+        await sentinel.close()
     logger.info("Iris shut down")
 
 

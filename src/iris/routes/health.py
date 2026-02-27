@@ -16,9 +16,13 @@ async def health(request: Request) -> HealthResponse:
     """Return service health status."""
     fetcher = request.app.state.fetcher
     cache = request.app.state.cache
+    sentinel = getattr(request.app.state, "sentinel", None)
     start_time: float = request.app.state.start_time
 
     cache_connected = cache.is_connected if cache else False
+    sentinel_connected = False
+    if sentinel is not None:
+        sentinel_connected = sentinel._client is not None
 
     return HealthResponse(
         status="ok",
@@ -26,6 +30,7 @@ async def health(request: Request) -> HealthResponse:
         version="0.1.0",
         browser_connected=fetcher.is_connected if fetcher else False,
         cache_connected=cache_connected,
+        sentinel_connected=sentinel_connected,
         active_pages=fetcher.active_pages if fetcher else 0,
         uptime_seconds=round(time.monotonic() - start_time, 2),
     )

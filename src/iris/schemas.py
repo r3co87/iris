@@ -146,5 +146,6 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
     browser_connected: bool = False
     cache_connected: bool = False
+    sentinel_connected: bool = False
     active_pages: int = 0
     uptime_seconds: float = 0.0
