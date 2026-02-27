@@ -14,7 +14,7 @@ from iris.extractor import ContentExtractor
 from iris.fetcher import FetchResult, PageFetcher
 from iris.routes.fetch import router as fetch_router
 from iris.routes.health import router as health_router
-from iris.schemas import FetchResponse
+from iris.schemas import FetchError, FetchErrorType, FetchResponse
 
 
 @pytest.fixture
@@ -159,14 +159,20 @@ class TestFetchEndpoint:
                 url="https://example.com",
                 status_code=0,
                 html="",
-                error="Connection refused",
+                error=FetchError(
+                    type=FetchErrorType.CONNECTION_ERROR,
+                    message="Connection refused",
+                    retryable=True,
+                ),
                 fetch_time_ms=50,
             )
         )
         resp = test_app.post("/fetch", json={"url": "https://example.com"})
         assert resp.status_code == 200
         data = resp.json()
-        assert data["error"] == "Connection refused"
+        assert data["error"] is not None
+        assert data["error"]["type"] == "connection_error"
+        assert data["error"]["message"] == "Connection refused"
         assert data["status_code"] == 0
 
     def test_fetch_browser_unavailable(self, test_app: TestClient) -> None:

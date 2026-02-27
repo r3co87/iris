@@ -2,7 +2,45 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+from typing import Any
+
 from pydantic import BaseModel, Field
+
+
+class WaitStrategy(StrEnum):
+    """Strategy for waiting on dynamic content."""
+
+    LOAD = "load"
+    NETWORKIDLE = "networkidle"
+    SELECTOR = "selector"
+    TIMEOUT = "timeout"
+    DOMCONTENTLOADED = "domcontentloaded"
+
+
+class FetchErrorType(StrEnum):
+    """Classification of fetch errors."""
+
+    TIMEOUT = "timeout"
+    DNS_ERROR = "dns_error"
+    CONNECTION_ERROR = "connection_error"
+    SSL_ERROR = "ssl_error"
+    BLOCKED_BY_ROBOTS = "blocked_by_robots_txt"
+    RATE_LIMITED = "rate_limited"
+    UNSUPPORTED_CONTENT_TYPE = "unsupported_content_type"
+    INVALID_URL = "invalid_url"
+    HTTP_ERROR = "http_error"
+    CONTENT_TOO_LARGE = "content_too_large"
+    BROWSER_ERROR = "browser_error"
+
+
+class FetchError(BaseModel):
+    """Structured error information for fetch failures."""
+
+    type: FetchErrorType
+    message: str
+    retryable: bool
+    http_status: int | None = None
 
 
 class FetchRequest(BaseModel):
@@ -14,6 +52,9 @@ class FetchRequest(BaseModel):
     )
     wait_after_load_ms: int | None = Field(
         None, description="Override default wait time after page load (ms)"
+    )
+    wait_strategy: WaitStrategy = Field(
+        WaitStrategy.LOAD, description="Wait strategy for dynamic content"
     )
     extract_text: bool = Field(True, description="Extract clean text from page")
     extract_links: bool = Field(False, description="Extract links from page")
@@ -44,6 +85,8 @@ class PageMetadata(BaseModel):
     canonical_url: str | None = None
     author: str | None = None
     published_date: str | None = None
+    pdf_pages: int | None = None
+    pdf_author: str | None = None
 
 
 class ExtractedLink(BaseModel):
@@ -52,6 +95,23 @@ class ExtractedLink(BaseModel):
     url: str
     text: str
     is_external: bool
+
+
+class StructuredData(BaseModel):
+    """Structured data extracted from a page (JSON-LD, Schema.org)."""
+
+    json_ld: list[dict[str, Any]] | None = None
+    schema_org_types: list[str] | None = None
+
+
+class PdfResult(BaseModel):
+    """Result of PDF text extraction."""
+
+    text: str
+    pages: int
+    title: str | None = None
+    author: str | None = None
+    created_date: str | None = None
 
 
 class FetchResponse(BaseModel):
@@ -64,10 +124,11 @@ class FetchResponse(BaseModel):
     metadata: PageMetadata | None = None
     links: list[ExtractedLink] | None = None
     screenshot_base64: str | None = None
+    structured_data: StructuredData | None = None
     content_length: int = 0
     fetch_time_ms: int = 0
     cached: bool = False
-    error: str | None = None
+    error: FetchError | None = None
 
 
 class BatchFetchResponse(BaseModel):

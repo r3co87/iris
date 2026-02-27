@@ -42,7 +42,12 @@ class Settings(BaseSettings):
 
     # Rate Limiting (Politeness)
     MIN_DELAY_BETWEEN_REQUESTS_MS: int = 1000
+    RATE_LIMIT_BURST: int = 3
     RESPECT_ROBOTS_TXT: bool = True
+    ROBOTS_TXT_CACHE_TTL: int = 86400  # 24h
+
+    # Retry
+    MAX_RETRIES: int = 3
 
     # Sentinel
     TESTING_MODE: bool = False

@@ -1,4 +1,4 @@
-"""Playwright-based page fetcher with concurrency control and politeness."""
+"""Playwright-based page fetcher with retry and error classification."""
 
 from __future__ import annotations
 
@@ -10,74 +10,116 @@ from urllib.parse import urlparse
 
 from iris.config import Settings
 from iris.logging import get_logger
+from iris.schemas import FetchError, FetchErrorType, WaitStrategy
+from iris.wait_strategy import SmartWaiter
 
 if TYPE_CHECKING:
-    from playwright.async_api import Browser, BrowserContext, Page, Playwright
+    from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response
 
 logger = get_logger(__name__)
 
+# HTTP status codes that are retryable
+_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
-class RobotsChecker:
-    """Simple robots.txt checker with caching."""
+# Content types we handle
+_HTML_TYPES = {"text/html", "application/xhtml+xml"}
+_PDF_TYPES = {"application/pdf"}
+_JSON_TYPES = {"application/json"}
+_TEXT_TYPES = {"text/plain"}
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}
 
-    def __init__(self) -> None:
-        self._cache: dict[str, tuple[bool, float]] = {}
-        self._cache_ttl = 3600.0  # 1 hour
 
-    async def is_allowed(self, url: str, user_agent: str, *, page: Page) -> bool:
-        """Check if URL is allowed by robots.txt."""
-        parsed = urlparse(url)
-        domain = f"{parsed.scheme}://{parsed.netloc}"
-        cache_key = f"{domain}:{parsed.path}"
+def classify_error(exc: Exception, url: str = "") -> FetchError:
+    """Classify an exception into a structured FetchError.
 
-        # Check cache
-        if cache_key in self._cache:
-            allowed, cached_at = self._cache[cache_key]
-            if time.monotonic() - cached_at < self._cache_ttl:
-                return allowed
+    Args:
+        exc: The exception that occurred.
+        url: The URL being fetched (for context).
 
-        try:
-            robots_url = f"{domain}/robots.txt"
-            response = await page.goto(robots_url, timeout=5000)
-            if response is None or response.status != 200:
-                self._cache[cache_key] = (True, time.monotonic())
-                return True
+    Returns:
+        A FetchError with appropriate type and retryable flag.
+    """
+    error_str = str(exc).lower()
+    exc_name = type(exc).__name__
 
-            content = await page.content()
-            allowed = self._parse_robots(content, parsed.path, user_agent)
-            self._cache[cache_key] = (allowed, time.monotonic())
-            return allowed
-        except Exception:
-            # If we can't check robots.txt, allow the request
-            self._cache[cache_key] = (True, time.monotonic())
-            return True
+    if isinstance(exc, TimeoutError) or "timeout" in error_str:
+        return FetchError(
+            type=FetchErrorType.TIMEOUT,
+            message=f"{exc_name}: {exc}",
+            retryable=True,
+        )
 
-    @staticmethod
-    def _parse_robots(content: str, path: str, user_agent: str) -> bool:
-        """Parse robots.txt content and check if path is allowed."""
-        lines = content.strip().split("\n")
-        current_agent_matches = False
-        disallowed_paths: list[str] = []
+    dns_keywords = ("dns", "name resolution", "getaddrinfo")
+    if any(kw in error_str for kw in dns_keywords):
+        return FetchError(
+            type=FetchErrorType.DNS_ERROR,
+            message=f"{exc_name}: {exc}",
+            retryable=True,
+        )
 
-        for line in lines:
-            line = line.strip()
-            if line.startswith("#") or not line:
-                continue
+    if "ssl" in error_str or "certificate" in error_str:
+        return FetchError(
+            type=FetchErrorType.SSL_ERROR,
+            message=f"{exc_name}: {exc}",
+            retryable=False,
+        )
 
-            if ":" not in line:
-                continue
+    if (
+        "connection" in error_str
+        or "reset" in error_str
+        or "refused" in error_str
+        or "broken pipe" in error_str
+        or isinstance(exc, ConnectionError)
+    ):
+        return FetchError(
+            type=FetchErrorType.CONNECTION_ERROR,
+            message=f"{exc_name}: {exc}",
+            retryable=True,
+        )
 
-            key, _, value = line.partition(":")
-            key = key.strip().lower()
-            value = value.strip()
+    # Default: browser error
+    return FetchError(
+        type=FetchErrorType.BROWSER_ERROR,
+        message=f"{exc_name}: {exc}",
+        retryable=False,
+    )
 
-            if key == "user-agent":
-                agent_match = value.lower() in user_agent.lower()
-                current_agent_matches = value == "*" or agent_match
-            elif key == "disallow" and current_agent_matches and value:
-                disallowed_paths.append(value)
 
-        return all(not path.startswith(d) for d in disallowed_paths)
+def classify_http_error(status_code: int) -> FetchError:
+    """Classify an HTTP status code error.
+
+    Args:
+        status_code: The HTTP status code.
+
+    Returns:
+        A FetchError with appropriate type and retryable flag.
+    """
+    retryable = status_code in _RETRYABLE_STATUS_CODES
+    if status_code == 429:
+        return FetchError(
+            type=FetchErrorType.RATE_LIMITED,
+            message=f"HTTP {status_code}: Too Many Requests",
+            retryable=True,
+            http_status=status_code,
+        )
+    return FetchError(
+        type=FetchErrorType.HTTP_ERROR,
+        message=f"HTTP {status_code}",
+        retryable=retryable,
+        http_status=status_code,
+    )
+
+
+def _get_content_type(content_type_header: str | None) -> str:
+    """Extract the base content type without parameters."""
+    if not content_type_header:
+        return "text/html"
+    return content_type_header.split(";")[0].strip().lower()
+
+
+def _is_pdf_url(url: str) -> bool:
+    """Check if URL looks like a PDF."""
+    return urlparse(url).path.lower().endswith(".pdf")
 
 
 class FetchResult:
@@ -89,8 +131,10 @@ class FetchResult:
         status_code: int,
         html: str,
         screenshot_bytes: bytes | None = None,
-        error: str | None = None,
+        error: FetchError | None = None,
         fetch_time_ms: int = 0,
+        content_type: str = "text/html",
+        raw_bytes: bytes | None = None,
     ) -> None:
         self.url = url
         self.status_code = status_code
@@ -98,10 +142,12 @@ class FetchResult:
         self.screenshot_bytes = screenshot_bytes
         self.error = error
         self.fetch_time_ms = fetch_time_ms
+        self.content_type = content_type
+        self.raw_bytes = raw_bytes
 
 
 class PageFetcher:
-    """Playwright-based async page fetcher with concurrency and rate limiting."""
+    """Playwright-based async page fetcher with retry logic."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -109,9 +155,7 @@ class PageFetcher:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_PAGES)
-        self._domain_last_request: dict[str, float] = {}
-        self._domain_locks: dict[str, asyncio.Lock] = {}
-        self._robots_checker = RobotsChecker()
+        self._waiter = SmartWaiter()
         self._connected = False
 
     @property
@@ -156,143 +200,286 @@ class PageFetcher:
         self._connected = False
         logger.info("Browser closed")
 
-    def _get_domain(self, url: str) -> str:
-        """Extract domain from URL."""
-        parsed = urlparse(url)
-        return parsed.netloc
-
-    def _get_domain_lock(self, domain: str) -> asyncio.Lock:
-        """Get or create a lock for a domain."""
-        if domain not in self._domain_locks:
-            self._domain_locks[domain] = asyncio.Lock()
-        return self._domain_locks[domain]
-
-    async def _enforce_rate_limit(self, domain: str) -> None:
-        """Enforce minimum delay between requests to the same domain."""
-        lock = self._get_domain_lock(domain)
-        async with lock:
-            now = time.monotonic()
-            last_request = self._domain_last_request.get(domain, 0.0)
-            min_delay = self.settings.MIN_DELAY_BETWEEN_REQUESTS_MS / 1000.0
-            elapsed = now - last_request
-
-            if elapsed < min_delay:
-                wait_time = min_delay - elapsed
-                logger.info("Rate limiting: domain=%s wait=%.2fs", domain, wait_time)
-                await asyncio.sleep(wait_time)
-
-            self._domain_last_request[domain] = time.monotonic()
-
     async def fetch(
         self,
         url: str,
         *,
         wait_for_selector: str | None = None,
         wait_after_load_ms: int | None = None,
+        wait_strategy: WaitStrategy = WaitStrategy.LOAD,
         timeout_ms: int | None = None,
         take_screenshot: bool = False,
         headers: dict[str, str] | None = None,
     ) -> FetchResult:
-        """Fetch a page with JS rendering.
+        """Fetch a page with JS rendering and automatic retries.
 
         Args:
             url: URL to fetch.
             wait_for_selector: CSS selector to wait for after page load.
             wait_after_load_ms: Time to wait after load event (ms).
+            wait_strategy: Strategy for waiting on dynamic content.
             timeout_ms: Page navigation timeout (ms).
             take_screenshot: Whether to capture a screenshot.
             headers: Custom HTTP headers.
 
         Returns:
-            FetchResult with HTML content and optional screenshot.
+            FetchResult with content and optional screenshot.
         """
         if not self._context:
             return FetchResult(
-                url=url, status_code=0, html="", error="Browser not started"
+                url=url,
+                status_code=0,
+                html="",
+                error=FetchError(
+                    type=FetchErrorType.BROWSER_ERROR,
+                    message="Browser not started",
+                    retryable=False,
+                ),
             )
 
-        domain = self._get_domain(url)
+        # Validate URL
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return FetchResult(
+                url=url,
+                status_code=0,
+                html="",
+                error=FetchError(
+                    type=FetchErrorType.INVALID_URL,
+                    message=f"Invalid URL: {url}",
+                    retryable=False,
+                ),
+            )
+
+        # Auto-select SELECTOR strategy when selector is provided
+        effective_strategy = wait_strategy
+        if wait_for_selector and wait_strategy == WaitStrategy.LOAD:
+            effective_strategy = WaitStrategy.SELECTOR
+
         timeout = timeout_ms or self.settings.PAGE_TIMEOUT_MS
         wait_after = wait_after_load_ms or self.settings.WAIT_AFTER_LOAD_MS
+        max_retries = self.settings.MAX_RETRIES
         start_time = time.monotonic()
 
         async with self._semaphore:
-            # Rate limiting
-            await self._enforce_rate_limit(domain)
+            last_result: FetchResult | None = None
 
-            page: Page | None = None
-            try:
-                page = await self._context.new_page()
-
-                # Set custom headers
-                if headers:
-                    await page.set_extra_http_headers(headers)
-
-                # Check robots.txt
-                if self.settings.RESPECT_ROBOTS_TXT:
-                    allowed = await self._robots_checker.is_allowed(
-                        url, self.settings.USER_AGENT, page=page
+            for attempt in range(max_retries + 1):
+                if attempt > 0:
+                    backoff = 2 ** (attempt - 1)
+                    logger.info(
+                        "Retry %d/%d for %s (backoff %ds)",
+                        attempt,
+                        max_retries,
+                        url,
+                        backoff,
                     )
-                    if not allowed:
-                        elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                        return FetchResult(
-                            url=url,
-                            status_code=403,
-                            html="",
-                            error="Blocked by robots.txt",
-                            fetch_time_ms=elapsed_ms,
-                        )
+                    await asyncio.sleep(backoff)
 
-                # Navigate
-                response = await page.goto(url, timeout=timeout, wait_until="load")
-                status_code = response.status if response else 0
+                result = await self._fetch_once(
+                    url=url,
+                    wait_for_selector=wait_for_selector,
+                    wait_after_load_ms=wait_after,
+                    wait_strategy=effective_strategy,
+                    timeout_ms=timeout,
+                    take_screenshot=take_screenshot,
+                    headers=headers,
+                    start_time=start_time,
+                )
+                last_result = result
 
-                # Wait for dynamic content
-                if wait_for_selector:
-                    try:
-                        await page.wait_for_selector(wait_for_selector, timeout=timeout)
-                    except Exception:
-                        logger.warning(
-                            "Selector wait timeout: url=%s selector=%s",
-                            url,
-                            wait_for_selector,
-                        )
+                if result.error is None:
+                    return result
 
-                # Additional wait for JS rendering
-                if wait_after > 0:
-                    await page.wait_for_timeout(wait_after)
+                # Check if error is retryable
+                if not result.error.retryable:
+                    return result
 
-                # Get content
-                html = await page.content()
+                # For HTTP 429, respect Retry-After
+                if (
+                    result.error.type == FetchErrorType.RATE_LIMITED
+                    and attempt < max_retries
+                ):
+                    # We already have backoff, but 429 might need more
+                    pass
 
-                # Screenshot
-                screenshot_bytes: bytes | None = None
-                if take_screenshot:
-                    screenshot_bytes = await page.screenshot(type="png", full_page=True)
+                if attempt >= max_retries:
+                    return result
 
+            # Should not reach here, but just in case
+            assert last_result is not None
+            return last_result
+
+    async def _fetch_once(
+        self,
+        url: str,
+        *,
+        wait_for_selector: str | None,
+        wait_after_load_ms: int,
+        wait_strategy: WaitStrategy,
+        timeout_ms: int,
+        take_screenshot: bool,
+        headers: dict[str, str] | None,
+        start_time: float,
+    ) -> FetchResult:
+        """Execute a single fetch attempt."""
+        assert self._context is not None
+
+        page: Page | None = None
+        try:
+            page = await self._context.new_page()
+
+            if headers:
+                await page.set_extra_http_headers(headers)
+
+            # Navigate
+            response: Response | None = await page.goto(
+                url, timeout=timeout_ms, wait_until="load"
+            )
+            status_code = response.status if response else 0
+
+            # Detect content type
+            content_type_header = (
+                response.headers.get("content-type") if response else None
+            )
+            content_type = _get_content_type(content_type_header)
+
+            # Check for HTTP errors
+            if status_code >= 400:
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                error = classify_http_error(status_code)
+                return FetchResult(
+                    url=url,
+                    status_code=status_code,
+                    html="",
+                    error=error,
+                    fetch_time_ms=elapsed_ms,
+                    content_type=content_type,
+                )
+
+            # Handle PDF content type (or .pdf URL)
+            if content_type in _PDF_TYPES or (
+                _is_pdf_url(url) and content_type == "application/octet-stream"
+            ):
+                raw_bytes = await response.body() if response else b""
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
                 return FetchResult(
                     url=url,
                     status_code=status_code,
-                    html=html,
-                    screenshot_bytes=screenshot_bytes,
+                    html="",
                     fetch_time_ms=elapsed_ms,
+                    content_type="application/pdf",
+                    raw_bytes=raw_bytes,
                 )
 
-            except Exception as e:
+            # Handle JSON
+            if content_type in _JSON_TYPES:
+                import json
+
+                raw_bytes = await response.body() if response else b""
+                try:
+                    parsed_json = json.loads(raw_bytes)
+                    pretty = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+                except Exception:
+                    pretty = raw_bytes.decode("utf-8", errors="replace")
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                error_msg = f"{type(e).__name__}: {e}"
-                logger.error("Fetch error: url=%s error=%s", url, error_msg)
                 return FetchResult(
                     url=url,
-                    status_code=0,
-                    html="",
-                    error=error_msg,
+                    status_code=status_code,
+                    html=pretty,
                     fetch_time_ms=elapsed_ms,
+                    content_type="application/json",
                 )
-            finally:
-                if page:
-                    await page.close()
+
+            # Handle plain text
+            if content_type in _TEXT_TYPES:
+                text = await page.content()
+                # Strip HTML wrapper that Playwright adds
+                from bs4 import BeautifulSoup
+
+                soup = BeautifulSoup(text, "lxml")
+                body = soup.find("body")
+                plain_text = body.get_text() if body else text
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                return FetchResult(
+                    url=url,
+                    status_code=status_code,
+                    html=plain_text,
+                    fetch_time_ms=elapsed_ms,
+                    content_type="text/plain",
+                )
+
+            # Handle images — metadata only
+            if content_type.startswith("image/"):
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                return FetchResult(
+                    url=url,
+                    status_code=status_code,
+                    html="",
+                    fetch_time_ms=elapsed_ms,
+                    content_type=content_type,
+                )
+
+            # Unsupported content types
+            if content_type not in _HTML_TYPES and content_type != "text/html":
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                return FetchResult(
+                    url=url,
+                    status_code=status_code,
+                    html="",
+                    error=FetchError(
+                        type=FetchErrorType.UNSUPPORTED_CONTENT_TYPE,
+                        message=f"Unsupported content type: {content_type}",
+                        retryable=False,
+                    ),
+                    fetch_time_ms=elapsed_ms,
+                    content_type=content_type,
+                )
+
+            # HTML content — apply wait strategy
+            if wait_strategy != WaitStrategy.LOAD:
+                await self._waiter.wait(
+                    page,
+                    wait_strategy,
+                    selector=wait_for_selector,
+                    timeout_ms=timeout_ms,
+                    wait_ms=wait_after_load_ms,
+                )
+
+            # Additional wait for JS rendering
+            if wait_after_load_ms > 0 and wait_strategy != WaitStrategy.TIMEOUT:
+                await page.wait_for_timeout(wait_after_load_ms)
+
+            html = await page.content()
+
+            screenshot_bytes: bytes | None = None
+            if take_screenshot:
+                screenshot_bytes = await page.screenshot(type="png", full_page=True)
+
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            return FetchResult(
+                url=url,
+                status_code=status_code,
+                html=html,
+                screenshot_bytes=screenshot_bytes,
+                fetch_time_ms=elapsed_ms,
+                content_type=content_type,
+            )
+
+        except Exception as e:
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            error = classify_error(e, url)
+            logger.error("Fetch error: url=%s error=%s", url, error.message)
+            return FetchResult(
+                url=url,
+                status_code=0,
+                html="",
+                error=error,
+                fetch_time_ms=elapsed_ms,
+            )
+        finally:
+            if page:
+                await page.close()
 
     async def screenshot(self, url: str) -> bytes:
         """Take a full-page screenshot.
@@ -308,7 +495,7 @@ class PageFetcher:
         """
         result = await self.fetch(url, take_screenshot=True)
         if result.error:
-            msg = f"Screenshot failed: {result.error}"
+            msg = f"Screenshot failed: {result.error.message}"
             raise RuntimeError(msg)
         if result.screenshot_bytes is None:
             msg = "Screenshot returned no data"

@@ -11,16 +11,22 @@ from iris.cache import CacheLayer, make_cache_key
 from iris.extractor import ContentExtractor
 from iris.fetcher import PageFetcher
 from iris.logging import get_logger
+from iris.pdf_extractor import PdfExtractor
 from iris.schemas import (
     BatchFetchRequest,
     BatchFetchResponse,
+    FetchError,
+    FetchErrorType,
     FetchRequest,
     FetchResponse,
+    PageMetadata,
 )
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+_pdf_extractor = PdfExtractor()
 
 
 async def _do_fetch(
@@ -50,6 +56,7 @@ async def _do_fetch(
         url=request.url,
         wait_for_selector=request.wait_for_selector,
         wait_after_load_ms=request.wait_after_load_ms,
+        wait_strategy=request.wait_strategy,
         timeout_ms=request.timeout_ms,
         take_screenshot=request.screenshot,
         headers=request.headers,
@@ -64,12 +71,76 @@ async def _do_fetch(
             fetch_time_ms=result.fetch_time_ms,
         )
 
-    # Extract content
+    # Handle PDF content
+    if result.content_type == "application/pdf" and result.raw_bytes:
+        pdf_result = await _pdf_extractor.extract(result.raw_bytes)
+        pdf_meta = PageMetadata(
+            title=pdf_result.title,
+            author=pdf_result.author,
+            pdf_pages=pdf_result.pages,
+            pdf_author=pdf_result.author,
+        )
+        response = FetchResponse(
+            url=result.url,
+            status_code=result.status_code,
+            content_text=pdf_result.text if request.extract_text else None,
+            metadata=pdf_meta if request.extract_metadata else None,
+            content_length=len(pdf_result.text) if pdf_result.text else 0,
+            fetch_time_ms=result.fetch_time_ms,
+            cached=False,
+        )
+        if request.cache:
+            await cache.set(cache_key, response)
+        return response
+
+    # Handle JSON content
+    if result.content_type == "application/json":
+        response = FetchResponse(
+            url=result.url,
+            status_code=result.status_code,
+            content_text=result.html if request.extract_text else None,
+            content_length=len(result.html) if result.html else 0,
+            fetch_time_ms=result.fetch_time_ms,
+            cached=False,
+        )
+        if request.cache:
+            await cache.set(cache_key, response)
+        return response
+
+    # Handle plain text
+    if result.content_type == "text/plain":
+        response = FetchResponse(
+            url=result.url,
+            status_code=result.status_code,
+            content_text=result.html if request.extract_text else None,
+            content_length=len(result.html) if result.html else 0,
+            fetch_time_ms=result.fetch_time_ms,
+            cached=False,
+        )
+        if request.cache:
+            await cache.set(cache_key, response)
+        return response
+
+    # Handle images — metadata only
+    if result.content_type.startswith("image/"):
+        response = FetchResponse(
+            url=result.url,
+            status_code=result.status_code,
+            metadata=PageMetadata() if request.extract_metadata else None,
+            content_length=0,
+            fetch_time_ms=result.fetch_time_ms,
+            cached=False,
+        )
+        if request.cache:
+            await cache.set(cache_key, response)
+        return response
+
+    # HTML content — full extraction
     content_text: str | None = None
     if request.extract_text:
         content_text = extractor.extract_text(result.html)
 
-    metadata = None
+    metadata: PageMetadata | None = None
     if request.extract_metadata:
         metadata = extractor.extract_metadata(result.html, result.url)
 
@@ -81,6 +152,8 @@ async def _do_fetch(
     if result.screenshot_bytes:
         screenshot_base64 = PageFetcher.screenshot_to_base64(result.screenshot_bytes)
 
+    structured_data = extractor.extract_structured_data(result.html)
+
     response = FetchResponse(
         url=result.url,
         status_code=result.status_code,
@@ -88,6 +161,7 @@ async def _do_fetch(
         metadata=metadata,
         links=links,
         screenshot_base64=screenshot_base64,
+        structured_data=structured_data,
         content_length=len(content_text) if content_text else 0,
         fetch_time_ms=result.fetch_time_ms,
         cached=False,
@@ -137,7 +211,11 @@ async def batch_fetch(request: Request, body: BatchFetchRequest) -> BatchFetchRe
                 FetchResponse(
                     url=body.requests[i].url,
                     status_code=0,
-                    error=str(result),
+                    error=FetchError(
+                        type=FetchErrorType.BROWSER_ERROR,
+                        message=str(result),
+                        retryable=False,
+                    ),
                 )
             )
         else:

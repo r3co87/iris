@@ -1,20 +1,22 @@
-"""Content extraction from HTML — clean text, metadata, and links."""
+"""Content extraction from HTML — clean text, metadata, links, structured data."""
 
 from __future__ import annotations
 
+import json
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
 from iris.config import Settings
 from iris.logging import get_logger
-from iris.schemas import ExtractedLink, PageMetadata
+from iris.schemas import ExtractedLink, PageMetadata, StructuredData
 
 logger = get_logger(__name__)
 
 
 class ContentExtractor:
-    """Extracts clean text, metadata, and links from HTML."""
+    """Extracts clean text, metadata, links, and structured data from HTML."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -152,6 +154,81 @@ class ContentExtractor:
             )
 
         return links
+
+    def extract_structured_data(self, html: str) -> StructuredData | None:
+        """Extract structured data from HTML (JSON-LD, Schema.org).
+
+        Args:
+            html: Raw HTML content.
+
+        Returns:
+            StructuredData with JSON-LD and Schema.org types, or None if none found.
+        """
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "lxml")
+
+        json_ld = self._extract_json_ld(soup)
+        schema_org_types = self._extract_schema_org_types(soup, json_ld)
+
+        if not json_ld and not schema_org_types:
+            return None
+
+        return StructuredData(
+            json_ld=json_ld if json_ld else None,
+            schema_org_types=schema_org_types if schema_org_types else None,
+        )
+
+    @staticmethod
+    def _extract_json_ld(soup: BeautifulSoup) -> list[dict[str, Any]]:
+        """Extract JSON-LD data from script tags."""
+        results: list[dict[str, Any]] = []
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                text = script.get_text(strip=True)
+                if not text:
+                    continue
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    results.append(data)
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            results.append(item)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return results
+
+    @staticmethod
+    def _extract_schema_org_types(
+        soup: BeautifulSoup,
+        json_ld_items: list[dict[str, Any]],
+    ) -> list[str]:
+        """Extract Schema.org types from JSON-LD and microdata."""
+        types: set[str] = set()
+
+        # From JSON-LD
+        for item in json_ld_items:
+            t = item.get("@type")
+            if isinstance(t, str):
+                types.add(t)
+            elif isinstance(t, list):
+                for sub_t in t:
+                    if isinstance(sub_t, str):
+                        types.add(sub_t)
+
+        # From microdata (itemtype attribute)
+        for element in soup.find_all(attrs={"itemtype": True}):
+            if isinstance(element, Tag):
+                itemtype = str(element.get("itemtype", ""))
+                if "schema.org" in itemtype:
+                    # Extract type name from URL like "https://schema.org/Article"
+                    type_name = itemtype.rstrip("/").rsplit("/", 1)[-1]
+                    if type_name:
+                        types.add(type_name)
+
+        return sorted(types)
 
     def _truncate(self, text: str) -> str:
         """Truncate text to MAX_CONTENT_LENGTH."""
