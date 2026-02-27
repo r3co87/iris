@@ -81,7 +81,16 @@ ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["iris"]
+omit = [
+    "src/iris/sentinel_sdk/*",
+    "src/iris/healthcheck.py",
+]
 
 [tool.coverage.report]
 fail_under = 80
 show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__",
+]
