@@ -7,7 +7,7 @@ Iris ist ein Playwright-basierter Web Automation Satellite im Cortex-Ökosystem,
 ```
 src/iris/
 ├── __init__.py              # Version
-├── main.py                  # FastAPI App + Lifespan (Browser Lifecycle)
+├── main.py                  # FastAPI App + Lifespan (Browser Lifecycle + Sentinel Init)
 ├── config.py                # Settings via Pydantic BaseSettings (IRIS_ prefix)
 ├── schemas.py               # Request/Response Models, Error Types, Enums
 ├── fetcher.py               # PageFetcher — Playwright, Retry, Content Type Detection
@@ -129,7 +129,7 @@ Healthcheck: `python -m iris.healthcheck` (prüft `GET /health`)
 ## Tests
 
 ```bash
-# Alle Tests (176 Tests)
+# Alle Tests (184 Tests)
 PYTHONPATH=src pytest tests/ -v
 
 # Mit Coverage
@@ -156,6 +156,7 @@ PYTHONPATH=src mypy src/iris/
 - `test_content_type.py` — HTML/PDF/JSON/Text/Image/Unsupported
 - `test_structured_data.py` — JSON-LD, Schema.org Microdata
 - `test_error_classification.py` — Alle FetchErrorType Varianten
+- `test_e2e_iris.py` — E2E-Tests: Sentinel-Integration, Health, Fetch, Batch, Cache
 
 ## Ökosystem-Kontext
 
@@ -167,7 +168,7 @@ PYTHONPATH=src mypy src/iris/
 
 ## Bekannte Issues / TODOs
 
-- [ ] Sentinel-Integration vollständig (Paket 3)
+- [x] Sentinel-Integration vollständig (Paket 3)
 - [ ] Stealth-Mode (Anti-Bot-Detection)
 - [ ] Proxy-Support
 - [ ] Cookie/Session Management
@@ -177,6 +178,6 @@ PYTHONPATH=src mypy src/iris/
 
 ### Aktueller Roadmap-Status
 
-Zuletzt abgeschlossen: Iris Paket 2 — Advanced Features + Robustness
-Nächster Schritt: Iris Paket 3 — Cortex Integration + Compose + Sentinel
+Zuletzt abgeschlossen: Iris Paket 3 — Cortex Integration + Docker Compose + Sentinel
+Nächster Schritt: Stealth-Mode, Proxy-Support, oder Recursive Crawling
 Datum: 2026-02-27
