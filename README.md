@@ -6,10 +6,16 @@ Playwright-based web fetching service for the **Cortex AI Personal Assistant** e
 
 - **JS Rendering** — Playwright Chromium headless for SPA and dynamic pages
 - **Content Extraction** — trafilatura + BeautifulSoup for clean text, metadata, links
+- **Structured Data** — JSON-LD and Schema.org microdata extraction
+- **PDF Extraction** — Text and metadata extraction via pymupdf
 - **Redis Cache** — SHA256-keyed response cache with configurable TTL
 - **Batch Fetching** — Up to 10 URLs concurrently with semaphore control
-- **Rate Limiting** — Per-domain politeness delays
-- **robots.txt** — Optional compliance with robots.txt rules
+- **Rate Limiting** — Redis-based Token Bucket per domain with memory fallback
+- **robots.txt** — Redis-cached compliance with 24h TTL
+- **Smart Wait Strategies** — load, networkidle, selector, timeout, domcontentloaded
+- **Retry Logic** — Exponential backoff for transient errors (timeout, 429, 5xx)
+- **Error Classification** — Typed errors with retryable flag and HTTP status
+- **Content Type Detection** — Auto-handles HTML, PDF, JSON, text, images
 - **Screenshots** — Full-page PNG screenshots as base64
 
 ## Quick Start
@@ -36,7 +42,25 @@ PYTHONPATH=src pytest tests/ -v
     "extract_metadata": true,
     "extract_links": false,
     "screenshot": false,
-    "cache": true
+    "cache": true,
+    "wait_strategy": "load",
+    "wait_for_selector": null,
+    "wait_after_load_ms": null,
+    "timeout_ms": null,
+    "headers": null
+}
+```
+
+Response includes typed error classification:
+
+```json
+{
+    "url": "https://example.com",
+    "status_code": 200,
+    "content_text": "...",
+    "metadata": { "title": "...", "pdf_pages": null },
+    "structured_data": { "json_ld": [...], "schema_org_types": [...] },
+    "error": { "type": "timeout", "message": "...", "retryable": true }
 }
 ```
 
